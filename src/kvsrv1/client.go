@@ -1,11 +1,20 @@
+/*
+ * @Author: zxiangfei 2464257291@qq.com
+ * @Date: 2025-08-06 17:18:58
+ * @LastEditors: zxiangfei 2464257291@qq.com
+ * @LastEditTime: 2025-08-10 00:21:06
+ * @FilePath: /MIT-6.5840-6.824/src/kvsrv1/client.go
+ * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
+ */
 package kvsrv
 
 import (
-	"6.5840/kvsrv1/rpc"
-	"6.5840/kvtest1"
-	"6.5840/tester1"
-)
+	"time"
 
+	"6.5840/kvsrv1/rpc"
+	kvtest "6.5840/kvtest1"
+	tester "6.5840/tester1"
+)
 
 type Clerk struct {
 	clnt   *tester.Clnt
@@ -30,7 +39,18 @@ func MakeClerk(clnt *tester.Clnt, server string) kvtest.IKVClerk {
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	// You will have to modify this function.
-	return "", 0, rpc.ErrNoKey
+	args := rpc.GetArgs{Key: key}
+	reply := rpc.GetReply{}
+
+	// 循环尝试RPC调用，直至成功
+	for {
+		ok := ck.clnt.Call(ck.server, "KVServer.Get", &args, &reply)
+		if ok {
+			return reply.Value, reply.Version, reply.Err
+		}
+		// 如果RPC调用失败，可能是网络问题或服务器不可用，等待一段时间后重试
+		time.Sleep(10 * time.Millisecond) // 延时10毫秒，避免过于频繁的请求
+	}
 }
 
 // Put updates key with value only if the version in the
@@ -52,5 +72,21 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Put(key, value string, version rpc.Tversion) rpc.Err {
 	// You will have to modify this function.
-	return rpc.ErrNoKey
+	args := rpc.PutArgs{Key: key, Value: value, Version: version}
+	reply := rpc.PutReply{}
+
+	count := 0 //用于标记重试次数
+	for {
+		ok := ck.clnt.Call(ck.server, "KVServer.Put", &args, &reply)
+		if ok {
+			if reply.Err == rpc.ErrVersion && count > 0 {
+				return rpc.ErrMaybe // 如果是重试后收到 ErrVersion，返回 ErrMaybe
+			}
+			return reply.Err // 成功或其他错误
+		}
+		count++ // 增加重试次数
+		// 其他情况无线重试
+		// 这里可以添加一些延时
+		time.Sleep(10 * time.Millisecond) // 延时10毫秒，避免过于频繁的请求
+	}
 }
