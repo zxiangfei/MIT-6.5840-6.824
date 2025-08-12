@@ -11,13 +11,13 @@ package raft
 // Make() 用来创建一个实现该接口的 Raft 节点。
 
 import (
-	//	"bytes"
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	tester "6.5840/tester1"
@@ -59,7 +59,7 @@ type Raft struct {
 	votedFor    int        // 当前任期内投票给的候选者（-1 表示未投票）
 	log         []LogEntry // Raft 日志条目（每个条目包含 command 和 term）
 	commitIndex int        // 已提交的日志条目的索引（>= lastApplied）
-	lastApplied int        // 已应用到状态机的日志条目的索引（>= commitIndex）
+	lastApplied int        // 已应用到状态机的日志条目的索引（ <= commitIndex）
 	nextIndex   []int      // leader 的易失状态：每个同伴的下一个日志索引（用于追加日志）
 	matchIndex  []int      // leader 的易失状态：每个同伴的已匹配日志索引（用于确认日志已提交）
 
@@ -69,6 +69,8 @@ type Raft struct {
 	// 3B
 	applyCh chan raftapi.ApplyMsg // 用于发送已提交日志到上层服务的通道（ApplyMsg）
 
+	// 用于通知 applyCh 的条件变量（当有新日志提交时唤醒等待的 goroutine），解决并发应用日志时的乱序的问题
+	applyCond *sync.Cond
 }
 
 // return currentTerm and whether this server
@@ -97,6 +99,18 @@ func (rf *Raft) persist() { // 将持久化状态写入稳定存储（崩溃后�
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+
+	w := new(bytes.Buffer)    // 创建一个字节缓冲区
+	e := labgob.NewEncoder(w) // 创建一个 labgob 编码器
+
+	// 只编码需要持久化的状态 `currentTerm`（当前任期）、`votedFor`（本任期投给谁）、`log[]`
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil) // 3C无快照，第二个参数传nil
+
 }
 
 // restore previously persisted state.
@@ -117,6 +131,30 @@ func (rf *Raft) readPersist(data []byte) { // 从稳定存储恢复之前持久�
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	r := bytes.NewBuffer(data) // 创建一个字节缓冲区
+	d := labgob.NewDecoder(r)  // 创建一个 labgob 解码器
+
+	var term int
+	var votedFor int
+	var log []LogEntry // 用于存储解码后的日志条目
+
+	if d.Decode(&term) != nil || // 解码当前任期
+		d.Decode(&votedFor) != nil || // 解码投票给的候选者
+		d.Decode(&log) != nil { // 解码日志条目
+		return // 如果解码失败，直接返回
+	}
+
+	rf.currentTerm = term  // 设置当前任期
+	rf.votedFor = votedFor // 设置投票给的候选者
+
+	// 确保日志非空；若持久化里就是空，也至少保留哨兵
+	if len(log) == 0 {
+		rf.log = make([]LogEntry, 1)            // 初始化日志为哨兵
+		rf.log[0] = LogEntry{Index: 0, Term: 0} // 哨兵条目
+	} else {
+		rf.log = log // 恢复日志条目
+	}
 }
 
 // how many bytes in Raft's persisted log?
@@ -242,7 +280,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		} else {
 			rf.commitIndex = lastNew
 		}
-		rf.applyCommittedLogsLocked() // 应用已提交的日志到状态机
+		// rf.applyCommittedLogsLocked() // 应用已提交的日志到状态机
+		// 使用专职 goroutine异步应用已提交日志，代替applyCommittedLogsLocked
+		if rf.applyCond != nil {
+			rf.applyCond.Signal()
+		}
 	}
 
 	reply.Term = rf.currentTerm // 返回当前任期
@@ -278,6 +320,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) { //
 
 	// 如果满足条件，投票给候选者
 	rf.votedFor = args.CandidateId // 记录投票给候选者
+	rf.persist()                   // 持久化投票状态
 	reply.Term = rf.currentTerm    // 返回当前任期
 	reply.VoteGranted = true       // 投票给候选者
 	rf.resetElectionTimeout()      // 重置选举超时：因为投票给了候选者，重置选举超时状态
@@ -366,6 +409,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) { // 上层请求把
 func (rf *Raft) Kill() { // 测试结束时会调用，标记该节点应当停止后台协程
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	rf.mu.Lock()
+	if rf.applyCond != nil {
+		rf.applyCond.Broadcast() // 唤醒等待中的 applyLoop，及时退出
+	}
+	rf.mu.Unlock()
 }
 
 func (rf *Raft) killed() bool { // 查询是否已被 Kill() 标记
@@ -430,6 +478,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.resetElectionTimeout() // 设置初始选举超时（150-350ms）
 
+	rf.mu.Lock()
+	rf.applyCond = sync.NewCond(&rf.mu) // 发布在 rf.mu 保护下
+	rf.mu.Unlock()
+
 	// initialize from state persisted before a crash
 	// 从持久化状态恢复（若之前崩溃过，这里能把 term/votedFor/log 恢复出来）
 	rf.readPersist(persister.ReadRaftState())
@@ -437,6 +489,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start ticker goroutine to start elections
 	// 启动后台节拍协程：负责超时选举/心跳发送等周期性工作
 	go rf.ticker()
+
+	go rf.applyLoop() // 启动应用日志的专职 goroutine
 
 	return rf // 以接口类型返回（raftapi.Raft），便于测试程序/服务端按接口调用
 }
@@ -601,7 +655,7 @@ func (rf *Raft) broadcastHeartbeat(term int) {
 		}
 
 		args := AppendEntriesArgs{
-			Term:         rf.currentTerm, // 当前任期号
+			Term:         term,           // 当前任期号
 			LeaderId:     rf.me,          // 领导者的 ID（本节点的索引）
 			PrevLogIndex: prevLogIndex,   // 前一个日志条目的索引
 			PrevLogTerm:  prevTerm,       // 前一个日志条目的任期号
@@ -652,6 +706,15 @@ func (rf *Raft) sendAppendEntries(peer int, args AppendEntriesArgs, term int) {
 		// Leader 尝试推进提交
 		rf.checkCommitLocked() // 检查是否有日志可以提交（Leader 端）
 	} else {
+
+		// 这次 RPC 覆盖到的最后日志下标（含）
+		sentEnd := args.PrevLogIndex + len(args.Entries)
+
+		// 若这条失败回复对应的发送范围，比我们现在已知的进度还“旧”，忽略它
+		if sentEnd < rf.matchIndex[peer] || sentEnd+1 < rf.nextIndex[peer] {
+			return // 过期失败回复，不能用它来回退 nextIndex
+		}
+
 		// 如果追加失败，说明对方的日志不一致，需要回退 nextIndex
 		// 快速回退
 		if reply.ConflictTerm == -1 {
@@ -698,9 +761,13 @@ func (rf *Raft) checkCommitLocked() {
 			}
 		}
 		if count >= len(rf.peers)/2+1 { // 如果超过半数节点已匹配
-			rf.commitIndex = i            // 更新已提交日志索引
-			rf.applyCommittedLogsLocked() // 应用已提交的日志到状态机
-			return                        // 提交成功，退出函数
+			rf.commitIndex = i // 更新已提交日志索引
+			// rf.applyCommittedLogsLocked() // 应用已提交的日志到状态机
+			// 使用专职 goroutine异步应用已提交日志，代替applyCommittedLogsLocked
+			if rf.applyCond != nil {
+				rf.applyCond.Signal() // 唤醒等待中的 applyLoop，应用已提交日志
+			}
+			return // 提交成功，退出函数
 		}
 	}
 }
@@ -708,27 +775,62 @@ func (rf *Raft) checkCommitLocked() {
 // 应用已提交的日志到状态机（Leader 端）
 // 从 (lastApplied, commitIndex] 复制条目，解锁后逐条发到 applyCh
 // 在加锁的前提下调用
-func (rf *Raft) applyCommittedLogsLocked() {
-	if rf.commitIndex <= rf.lastApplied {
-		return // 没有新的日志需要应用
-	}
-	// 复制可提交的条目
-	start := rf.lastApplied + 1            // 从下一个未应用的日志开始
-	end := rf.commitIndex + 1              // 到已提交的日志索引为止
-	toApply := make([]LogEntry, end-start) // 创建待应用的日志条目切片
-	copy(toApply, rf.log[start:end])       // 复制日志条目
-	rf.lastApplied = rf.commitIndex        // 更新已应用日志索引
+// func (rf *Raft) applyCommittedLogsLocked() {
+// 	if rf.commitIndex <= rf.lastApplied {
+// 		return // 没有新的日志需要应用
+// 	}
+// 	// 复制可提交的条目
+// 	start := rf.lastApplied + 1            // 从下一个未应用的日志开始
+// 	end := rf.commitIndex + 1              // 到已提交的日志索引为止
+// 	toApply := make([]LogEntry, end-start) // 创建待应用的日志条目切片
+// 	copy(toApply, rf.log[start:end])       // 复制日志条目
+// 	rf.lastApplied = rf.commitIndex        // 更新已应用日志索引
 
-	// 解锁后逐条发到 applyCh
-	ch := rf.applyCh
-	rf.mu.Unlock() // 释放锁，允许其他操作
-	for _, entry := range toApply {
+// 	// 解锁后逐条发到 applyCh
+// 	ch := rf.applyCh
+// 	rf.mu.Unlock() // 释放锁，允许其他操作
+// 	for _, entry := range toApply {
+// 		msg := raftapi.ApplyMsg{
+// 			CommandValid: true,          // 表示这是一个应用层命令
+// 			Command:      entry.Command, // 应用的命令
+// 			CommandIndex: entry.Index,   // 命令在日志中的索引
+// 		}
+// 		ch <- msg // 发送到 applyCh
+// 	}
+// 	rf.mu.Lock() // 重新获取锁，确保状态一致性
+// }
+
+// 专职应用已提交日志的协程，代替applyCommittedLogsLocked
+func (rf *Raft) applyLoop() {
+	rf.mu.Lock() // 获取锁，确保状态一致性
+	// 如果某些实例因为时序问题没初始化到，兜底再建一次
+	if rf.applyCond == nil {
+		rf.applyCond = sync.NewCond(&rf.mu)
+	}
+	defer rf.mu.Unlock() // 确保函数结束时释放锁
+
+	for !rf.killed() { // 循环直到被 Kill()
+		for rf.lastApplied >= rf.commitIndex { // 等待有新的日志可应用
+			rf.applyCond.Wait() // 等待条件变量，直到有新的日志可应用
+			if rf.killed() {    // 如果被 Kill()，退出循环
+				return
+			}
+		}
+
+		// 每次只推进一步，天然保证顺序
+		index := rf.lastApplied + 1 // 下一个要应用的日志索引
+		entry := rf.log[index]      // 获取要应用的日志条目
+		rf.lastApplied = index      // 更新已应用日志索引
+
 		msg := raftapi.ApplyMsg{
 			CommandValid: true,          // 表示这是一个应用层命令
 			Command:      entry.Command, // 应用的命令
 			CommandIndex: entry.Index,   // 命令在日志中的索引
 		}
-		ch <- msg // 发送到 applyCh
+
+		ch := rf.applyCh // 获取 applyCh
+		rf.mu.Unlock()   // 释放锁，允许其他操作
+		ch <- msg        // 发送到 applyCh
+		rf.mu.Lock()     // 重新获取锁，确保状态一致性
 	}
-	rf.mu.Lock() // 重新获取锁，确保状态一致性
 }
