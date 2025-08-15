@@ -1,20 +1,22 @@
 package kvraft
 
 import (
-	"6.5840/kvsrv1/rpc"
-	"6.5840/kvtest1"
-	"6.5840/tester1"
-)
+	"time"
 
+	"6.5840/kvsrv1/rpc"
+	kvtest "6.5840/kvtest1"
+	tester "6.5840/tester1"
+)
 
 type Clerk struct {
 	clnt    *tester.Clnt
 	servers []string
 	// You will have to modify this struct.
+	leaderHint int
 }
 
 func MakeClerk(clnt *tester.Clnt, servers []string) kvtest.IKVClerk {
-	ck := &Clerk{clnt: clnt, servers: servers}
+	ck := &Clerk{clnt: clnt, servers: servers, leaderHint: 0}
 	// You'll have to add code here.
 	return ck
 }
@@ -32,7 +34,29 @@ func MakeClerk(clnt *tester.Clnt, servers []string) kvtest.IKVClerk {
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 
 	// You will have to modify this function.
-	return "", 0, ""
+	args := rpc.GetArgs{Key: key}
+	n := len(ck.servers)
+	start := ck.leaderHint
+
+	for i := 0; ; i++ {
+		si := (start + i) % n
+		var reply rpc.GetReply
+		ok := ck.clnt.Call(ck.servers[si], "KVServer.Get", &args, &reply)
+		if ok {
+			switch reply.Err {
+			case rpc.OK, rpc.ErrNoKey:
+				// 成功或不存在都算确定结果
+				ck.leaderHint = si
+				return reply.Value, reply.Version, reply.Err
+			case rpc.ErrWrongLeader:
+				// 不是 leader，换下一台
+			default:
+				// 其他错误（如果有）：继续重试
+			}
+		}
+		// RPC 失败或非确定性错误：短暂休眠后换下一台
+		time.Sleep(3 * time.Millisecond)
+	}
 }
 
 // Put updates key with value only if the version in the
@@ -54,5 +78,35 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 	// You will have to modify this function.
-	return ""
+	args := rpc.PutArgs{Key: key, Value: value, Version: version}
+	n := len(ck.servers)
+	start := ck.leaderHint
+
+	firstAttempt := true
+	for i := 0; ; i++ {
+		si := (start + i) % n
+		var reply rpc.PutReply
+		ok := ck.clnt.Call(ck.servers[si], "KVServer.Put", &args, &reply)
+		if ok {
+			switch reply.Err {
+			case rpc.OK:
+				ck.leaderHint = si
+				return rpc.OK
+			case rpc.ErrVersion:
+				// 规则：第一次 RPC 收到 ErrVersion -> 一定没执行；重发期间收到 -> ErrMaybe
+				if firstAttempt {
+					return rpc.ErrVersion
+				}
+				return rpc.ErrMaybe
+			case rpc.ErrWrongLeader:
+				// 不是 leader，继续探测
+			default:
+				// 其他错误：继续重试
+			}
+		}
+
+		// 走到这里，说明要进行“重发”了
+		firstAttempt = false
+		time.Sleep(3 * time.Millisecond)
+	}
 }

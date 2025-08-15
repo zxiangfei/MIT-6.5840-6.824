@@ -29,7 +29,7 @@ type Raft interface {
 // ApplyMsg, but set CommandValid to false for these other uses.
 type ApplyMsg struct {
 	CommandValid bool        // true表示 Command 字段包含一个已提交的日志条目，false 表示 Command 字段包含其他类型的消息（如快照）
-	Command      interface{} // 提交的应用层命令（比如 kv 的 Put/Append）
+	Command      interface{} // 提交的应用层命令（比如 kv 的 Put/get）
 	CommandIndex int         // 该命令在 Raft 日志里的 索引。上层通常会用它做去重/顺序检查。
 
 	SnapshotValid bool   // 这是一条快照消息（3D 才用）。此时 CommandValid 必须是 false

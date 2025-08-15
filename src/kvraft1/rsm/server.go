@@ -8,7 +8,7 @@ import (
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
-	"6.5840/tester1"
+	tester "6.5840/tester1"
 )
 
 type Inc struct {
@@ -79,9 +79,12 @@ func (rs *rsmSrv) Snapshot() []byte {
 func (rs *rsmSrv) Restore(data []byte) {
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
-	if d.Decode(&rs.counter) != nil {
+
+	var c int // 零值局部变量作为 Decode 目标
+	if d.Decode(&c) != nil {
 		log.Fatalf("%v couldn't decode counter", rs.me)
 	}
+	rs.counter = c
 	//log.Printf("%d: restore %d", rs.me, rs.counter)
 }
 
