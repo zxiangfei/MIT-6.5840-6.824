@@ -6,13 +6,13 @@ import (
 )
 
 type FreezeShardArgs struct {
-	Shard shardcfg.Tshid
-	Num   shardcfg.Tnum
+	Shard shardcfg.Tshid // 要冻结的分片编号
+	Num   shardcfg.Tnum  // 配置版本号
 }
 
 type FreezeShardReply struct {
-	State []byte
-	Num   shardcfg.Tnum
+	State []byte        // 冻结的分片状态（序列化字节）
+	Num   shardcfg.Tnum // 配置版本号
 	Err   rpc.Err
 }
 

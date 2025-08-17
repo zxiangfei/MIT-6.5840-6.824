@@ -18,10 +18,16 @@ const (
 
 type Tversion uint64
 
+type Tclient uint64
+type Treq uint64
+
 type PutArgs struct {
 	Key     string
 	Value   string
 	Version Tversion
+
+	Client Tclient
+	Req    Treq // 用于幂等性
 }
 
 type PutReply struct {
@@ -37,4 +43,3 @@ type GetReply struct {
 	Version Tversion
 	Err     Err
 }
-
