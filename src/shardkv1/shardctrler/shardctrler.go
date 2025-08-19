@@ -15,7 +15,10 @@ import (
 	tester "6.5840/tester1"
 )
 
-const cfgKey = "shardcfg/current" // 用于标识当前配置的键名
+const (
+	cfgKey     = "shardcfg/current" // 用于标识当前配置的键名
+	nextCfgKey = "shardcfg/next"    // 用于标识下一个配置的键名,在新配置未完成时使用
+)
 
 // ShardCtrler for the controller and kv clerk.
 // 控制器
@@ -43,6 +46,35 @@ func MakeShardCtrler(clnt *tester.Clnt) *ShardCtrler {
 // Part A： 不需要做任何事
 // Part B/C： 会在新控制器重启/接管时调用，用来“恢复状态”
 func (sck *ShardCtrler) InitController() {
+	// Your code here.
+	// Part A: 不需要做任何事
+	// Part B/C: 可以在这里实现恢复状态的逻辑
+	// 例如：从 kvsrv 中读取当前配置，或初始化一些内部状态
+
+	// 检查kvserver是否存在为完成的新配置
+	curStr, _, e1 := sck.IKVClerk.Get(cfgKey)
+	if e1 != rpc.OK || curStr == "" {
+		return
+	}
+	cur := shardcfg.FromString(curStr)
+
+	nextStr, _, e2 := sck.IKVClerk.Get(nextCfgKey)
+	if e2 != rpc.OK || nextStr == "" {
+		return
+	}
+	next := shardcfg.FromString(nextStr)
+
+	// 如果 next 配置号比当前大 → 说明有没完成的 reconfig
+	if next.Num > cur.Num {
+		sck.ChangeConfigTo(next) // 启动一个 新的goroutine 接着进行 reconfig
+		return
+	}
+
+	// next 过期了，清理一下（防止误触发）
+	if next.Num <= cur.Num {
+		sck.casClearNext()
+	}
+
 }
 
 // Called once by the tester to supply the first configuration.  You
@@ -66,6 +98,14 @@ func (sck *ShardCtrler) InitConfig(cfg *shardcfg.ShardConfig) {
 func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 	target := new.String() // 目标配置的字符串表示
 
+	// 在迁移开始前将new 配置写入 kvsrv 的 nextCfgKey 键中
+	// 这样可以在重启时知道有未完成的迁移
+	nextStr, _, _ := sck.IKVClerk.Get(nextCfgKey) // 获取当前 next 配置
+	if nextStr != target {                        // 如果当前 next 配置不是目标配置，则更新
+		// 更新 nextCfgKey 键为目标配置
+		sck.casSetNext(target)
+	}
+
 	// 外层无限循环，直到成功发布新配置
 	for {
 		curStr, _, e := sck.IKVClerk.Get(cfgKey) // 获取当前配置的字符串表示
@@ -73,6 +113,8 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 			return
 		}
 		if curStr == target { // 如果当前配置已经是目标配置，则直接返回
+			// 已经是目标配置 → 清掉 nextCfgKey
+			sck.casClearNext()
 			return
 		}
 		old := shardcfg.FromString(curStr) // 从字符串还原当前配置对象
@@ -99,7 +141,13 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 
 			// 任何一边不存在、gid 为 0（未分配）、或成员列表为空，都说明当前还不具备迁移条件
 			// 标记本轮未完成，跳过该 shard，下轮再试
-			if !okO || !okN || ogid == 0 || ngid == 0 || len(osrvs) == 0 || len(nsrvs) == 0 {
+			// if !okO || !okN || ogid == 0 || ngid == 0 || len(osrvs) == 0 || len(nsrvs) == 0 {
+			// 	allDone = false
+			// 	continue
+			// }
+
+			// 改为（只卡新组；旧组可缺席）：
+			if !okN || ngid == 0 || len(nsrvs) == 0 {
 				allDone = false
 				continue
 			}
@@ -107,28 +155,27 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 			// 至此，可以直线当前分片的迁移了
 
 			// 构造访问新旧组的 RPC客户端,用于调用freeze/install/delete RPC
-			ock := shardgrp.MakeClerk(sck.clnt, osrvs)
 			nck := shardgrp.MakeClerk(sck.clnt, nsrvs)
 
 			// 分片的迁移过程是先冻结旧组的分片，然后安装到新组，最后删除旧组的分片
-			// 1) Freeze @ old：只认 OK，WrongGroup 这一轮不算完成
+			// 1) Freeze @ old：
 			froze := false // 标记是否成功冻结
 			var state []byte
-			{
+			if okO && ogid != 0 && len(osrvs) > 0 {
+				// 旧组存在：尝试真正 Freeze
+				ock := shardgrp.MakeClerk(sck.clnt, osrvs)
 				backoff := 5 * time.Millisecond
-				// 用指数回退（5ms 起，封顶 100ms，最多 20 次）进行重试
 				for attempt := 0; attempt < 20; attempt++ {
-					st, err := ock.FreezeShard(s, new.Num) // 调用旧组的 FreezeShard RPC
-
-					// 如果返回 OK，表示成功冻结
+					st, err := ock.FreezeShard(s, new.Num)
 					if err == rpc.OK {
 						state = st
 						froze = true
 						break
 					}
-
-					// 如果返回 WrongGroup，表示当前分片不属于旧组，跳出重试
 					if err == rpc.ErrWrongGroup {
+						// 旧组已不再负责该 shard：视为“已冻结且为空”
+						froze = true
+						state = nil
 						break
 					}
 					time.Sleep(backoff)
@@ -136,6 +183,10 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 						backoff *= 2
 					}
 				}
+			} else {
+				// 旧组缺席（ogid==0 / 没在 old.Groups / 成员表空）：直接视为“已冻结 + 空状态”
+				froze = true
+				state = nil
 			}
 
 			// 如果没有成功冻结，标记本轮未完成，跳过该 shard，下轮再试
@@ -147,8 +198,8 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 			// 2) Install @ new：只有非空 state 且返回 OK 才算成功
 			installed := false // 标记是否成功安装
 
-			// 只有当 state 非空（说明 shard 在旧组确实有内容）才去安装
-			if len(state) > 0 {
+			// 无论 state 是否为空，都必须安装来推进配置号
+			{
 				backoff := 5 * time.Millisecond
 				// 用指数回退（5ms 起，封顶 100ms，最多 20 次）进行重试
 				for attempt := 0; attempt < 20; attempt++ {
@@ -175,13 +226,15 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 				continue
 			}
 
-			// 3) Delete @ old：尽力
-			// 只要返回 OK 或 WrongGroup，就算成功删除
-			for j := 0; j < 5; j++ {
-				if err := ock.DeleteShard(s, new.Num); err == rpc.OK || err == rpc.ErrWrongGroup {
-					break
+			// 3) Delete @ old：仅当旧组存在时“尽力删除”
+			if okO && ogid != 0 && len(osrvs) > 0 {
+				ock := shardgrp.MakeClerk(sck.clnt, osrvs)
+				for j := 0; j < 5; j++ {
+					if err := ock.DeleteShard(s, new.Num); err == rpc.OK || err == rpc.ErrWrongGroup {
+						break
+					}
+					time.Sleep(time.Duration(10*(j+1)) * time.Millisecond)
 				}
-				time.Sleep(time.Duration(10*(j+1)) * time.Millisecond)
 			}
 		}
 
@@ -206,9 +259,11 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 				return
 			}
 			if cur == target {
+				sck.casClearNext()
 				return
 			}
 			if sck.IKVClerk.Put(cfgKey, target, ver) == rpc.OK {
+				sck.casClearNext()
 				return
 			}
 			break // 版本冲突 → 外层重来
@@ -225,4 +280,31 @@ func (sck *ShardCtrler) Query() *shardcfg.ShardConfig {
 		return shardcfg.MakeShardConfig() // 如果没有配置，则返回一个空配置
 	}
 	return shardcfg.FromString(cfgStr) // 从字符串还原配置对象
+}
+
+// --- 新增 ---
+func (sck *ShardCtrler) casSetNext(target string) {
+	for {
+		cur, ver, _ := sck.IKVClerk.Get(nextCfgKey)
+		if cur == target {
+			return
+		}
+		if sck.IKVClerk.Put(nextCfgKey, target, ver) == rpc.OK {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+func (sck *ShardCtrler) casClearNext() {
+	for {
+		cur, ver, _ := sck.IKVClerk.Get(nextCfgKey)
+		if cur == "" {
+			return
+		}
+		if sck.IKVClerk.Put(nextCfgKey, "", ver) == rpc.OK {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 }

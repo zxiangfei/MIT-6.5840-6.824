@@ -2,7 +2,7 @@
  * @Author: zxiangfei 2464257291@qq.com
  * @Date: 2025-08-06 17:18:58
  * @LastEditors: zxiangfei 2464257291@qq.com
- * @LastEditTime: 2025-08-18 01:38:31
+ * @LastEditTime: 2025-08-20 00:05:56
  * @FilePath: /MIT-6.5840-6.824/src/shardkv1/shardgrp/server.go
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
  */
@@ -185,46 +185,54 @@ func (kv *KVServer) DoOp(req any) any {
 		s, num := args.Shard, args.Num
 		m := kv.shMeta[s]
 
-		// 只接受更“新”的安装（num >= m.Epoch），确保单调性；num < m.Epoch 直接 OK（忽略陈旧安装）
-		if num >= m.Epoch {
-			// 拒绝空安装：必须带快照才切 Serving
-			if len(args.State) == 0 {
-				return shardrpc.InstallShardReply{Err: rpc.ErrMaybe}
-			}
+		// 幂等快路径：已安装到同一或更高 epoch 直接 OK
+		if num < m.Epoch || (num == m.Epoch && m.State == shServing) {
+			return shardrpc.InstallShardReply{Err: rpc.OK}
+		}
 
-			// 解码 dump，校验 shard
-			var dump shardDump
-			if err := labgob.NewDecoder(bytes.NewReader(args.State)).Decode(&dump); err != nil {
-				return shardrpc.InstallShardReply{Err: rpc.ErrMaybe}
-			}
-			if dump.Shard != s {
-				return shardrpc.InstallShardReply{Err: rpc.ErrMaybe}
-			}
-
-			// 覆盖该 shard 的键
+		// 接受空安装：清理该 shard 的旧键，推进到 Serving@num
+		if len(args.State) == 0 {
 			for k := range kv.store {
 				if shardcfg.Key2Shard(k) == s {
 					delete(kv.store, k)
 				}
 			}
-			for k, v := range dump.KVs {
-				kv.store[k] = v
-			}
-
-			// 合并 dup（并集）
-			for cid, mp := range dump.Dup {
-				if kv.dup[cid] == nil {
-					kv.dup[cid] = make(map[rpc.Treq]rpc.PutReply)
-				}
-				for rq, rep := range mp {
-					if _, ok := kv.dup[cid][rq]; !ok {
-						kv.dup[cid][rq] = rep
-					}
-				}
-			}
-
 			kv.shMeta[s] = meta{Epoch: num, State: shServing}
+			return shardrpc.InstallShardReply{Err: rpc.OK}
 		}
+
+		// 非空安装：解码并覆盖
+		var dump shardDump
+		if err := labgob.NewDecoder(bytes.NewReader(args.State)).Decode(&dump); err != nil {
+			return shardrpc.InstallShardReply{Err: rpc.ErrMaybe}
+		}
+		if dump.Shard != s {
+			return shardrpc.InstallShardReply{Err: rpc.ErrMaybe}
+		}
+
+		// 覆盖该 shard 的键
+		for k := range kv.store {
+			if shardcfg.Key2Shard(k) == s {
+				delete(kv.store, k)
+			}
+		}
+		for k, v := range dump.KVs {
+			kv.store[k] = v
+		}
+
+		// 合并 dup（并集）
+		for cid, mp := range dump.Dup {
+			if kv.dup[cid] == nil {
+				kv.dup[cid] = make(map[rpc.Treq]rpc.PutReply)
+			}
+			for rq, rep := range mp {
+				if _, ok := kv.dup[cid][rq]; !ok {
+					kv.dup[cid][rq] = rep
+				}
+			}
+		}
+
+		kv.shMeta[s] = meta{Epoch: num, State: shServing}
 		return shardrpc.InstallShardReply{Err: rpc.OK}
 
 	// 删除某个 shard
