@@ -100,10 +100,34 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 
 	// 在迁移开始前将new 配置写入 kvsrv 的 nextCfgKey 键中
 	// 这样可以在重启时知道有未完成的迁移
-	nextStr, _, _ := sck.IKVClerk.Get(nextCfgKey) // 获取当前 next 配置
-	if nextStr != target {                        // 如果当前 next 配置不是目标配置，则更新
-		// 更新 nextCfgKey 键为目标配置
-		sck.casSetNext(target)
+	// nextStr, _, _ := sck.IKVClerk.Get(nextCfgKey) // 获取当前 next 配置
+	// if nextStr != target {                        // 如果当前 next 配置不是目标配置，则更新
+	// 	// 更新 nextCfgKey 键为目标配置
+	// 	sck.casSetNext(target)
+	// }
+
+	// 0) 若已经是目标配置，则（只在 next==target 时）清掉 next 并返回
+	if curStr, _, e := sck.IKVClerk.Get(cfgKey); e == rpc.OK && curStr == target {
+		// 避免误删别人的任务：仅在 next 仍等于我们这份 target 时清理
+		sck.clearNextIfEq(target)
+		return
+	}
+
+	// 1) 需要推进一次 reconfig，先判定/发布 next
+	curStr, _, e := sck.IKVClerk.Get(cfgKey)
+	if e != rpc.OK {
+		return
+	}
+	cur := shardcfg.FromString(curStr)
+
+	// 仅当我们确实在推进“更高版本”的配置时，才需要占/跟随 next；
+	// 若 new.Num <= cur.Num，说明这次调用是冗余的，直接下面循环会快速返回。
+	if cur.Num < new.Num {
+		ok := sck.tryPublishNextIfEmpty(target)
+		if !ok {
+			// 有别的 next 正在进行，且目标不同：让出并退出
+			return
+		}
 	}
 
 	// 外层无限循环，直到成功发布新配置
@@ -114,7 +138,7 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 		}
 		if curStr == target { // 如果当前配置已经是目标配置，则直接返回
 			// 已经是目标配置 → 清掉 nextCfgKey
-			sck.casClearNext()
+			sck.clearNextIfEq(target)
 			return
 		}
 		old := shardcfg.FromString(curStr) // 从字符串还原当前配置对象
@@ -259,11 +283,11 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 				return
 			}
 			if cur == target {
-				sck.casClearNext()
+				sck.clearNextIfEq(target)
 				return
 			}
 			if sck.IKVClerk.Put(cfgKey, target, ver) == rpc.OK {
-				sck.casClearNext()
+				sck.clearNextIfEq(target)
 				return
 			}
 			break // 版本冲突 → 外层重来
@@ -300,6 +324,44 @@ func (sck *ShardCtrler) casClearNext() {
 	for {
 		cur, ver, _ := sck.IKVClerk.Get(nextCfgKey)
 		if cur == "" {
+			return
+		}
+		if sck.IKVClerk.Put(nextCfgKey, "", ver) == rpc.OK {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// 仅当 next 为空时尝试写入 target；
+// 若 next 已是 target，则允许“跟随”（返回 true）；
+// 若 next 是其它值，则认定为被他人占用（返回 false）。
+func (sck *ShardCtrler) tryPublishNextIfEmpty(target string) bool {
+	for {
+		cur, ver, _ := sck.IKVClerk.Get(nextCfgKey)
+		switch {
+		case cur == target:
+			// 别人已经发布了相同的目标：跟随
+			return true
+		case cur != "":
+			// 被他人占用且目标不同：让出
+			return false
+		default:
+			// cur == ""，尝试从空置写入 target
+			if sck.IKVClerk.Put(nextCfgKey, target, ver) == rpc.OK {
+				return true // 我们拿到发布权
+			}
+			// 竞争失败，重试一轮读取判定
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
+}
+
+// 仅当 next 仍等于 expected 时清空，避免误删他人条目
+func (sck *ShardCtrler) clearNextIfEq(expected string) {
+	for {
+		cur, ver, _ := sck.IKVClerk.Get(nextCfgKey)
+		if cur != expected {
 			return
 		}
 		if sck.IKVClerk.Put(nextCfgKey, "", ver) == rpc.OK {

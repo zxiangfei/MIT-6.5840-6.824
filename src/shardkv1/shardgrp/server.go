@@ -2,7 +2,7 @@
  * @Author: zxiangfei 2464257291@qq.com
  * @Date: 2025-08-06 17:18:58
  * @LastEditors: zxiangfei 2464257291@qq.com
- * @LastEditTime: 2025-08-20 00:05:56
+ * @LastEditTime: 2025-08-20 18:53:30
  * @FilePath: /MIT-6.5840-6.824/src/shardkv1/shardgrp/server.go
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
  */
@@ -94,7 +94,7 @@ func (kv *KVServer) DoOp(req any) any {
 		sh := shardcfg.Key2Shard(args.Key) // 计算 key 所属的分片编号
 		m := kv.shMeta[sh]                 // 查询该分片的元数据
 		// 如果分片不在 Serving 状态,返回ErrWrongGroup，上层会刷新配置后重新发起请求
-		if m.State != shServing {
+		if m.State == shNone {
 			return rpc.GetReply{Err: rpc.ErrWrongGroup}
 		}
 
